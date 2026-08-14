@@ -198,7 +198,6 @@ class Qwen3ASRAudioAttention(nn.Module):
             num_heads=self.num_local_heads,
             head_size=self.head_dim,
             scale=self.scaling,
-            multimodal_config=multimodal_config,
         )
 
     def forward(
@@ -359,15 +358,11 @@ class Qwen3ASRAudioEncoder(nn.Module):
         self.proj2 = nn.Linear(config.d_model, config.output_dim)
 
         # Get attention backend
-        attn_backend_override = (
-            multimodal_config.mm_encoder_attn_backend
-            if multimodal_config is not None
-            else None
-        )
+        # NOTE: vLLM 0.15+ 的 get_vit_attn_backend 不再接受 attn_backend_override，
+        # 自行按 head_size/dtype 选 backend。如需覆盖，用 VLLM_ATTENTION_BACKEND 环境变量。
         self.attn_backend = get_vit_attn_backend(
             head_size=config.d_model // config.encoder_attention_heads,
             dtype=torch.get_default_dtype(),
-            attn_backend_override=attn_backend_override,
         )
 
     def compute_attn_mask_seqlen(self, cu_seqlens: torch.Tensor) -> torch.Tensor | None:

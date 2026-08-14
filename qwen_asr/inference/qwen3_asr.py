@@ -50,6 +50,17 @@ try:
     from qwen_asr.core.vllm_backend import Qwen3ASRForConditionalGeneration
     from vllm import ModelRegistry
     ModelRegistry.register_model("Qwen3ASRForConditionalGeneration", Qwen3ASRForConditionalGeneration)
+
+    # vLLM 0.15.x 的 _CONFIG_REGISTRY 把 model_type="qwen3_asr" 映射到一个
+    # 内置但缺失实现文件的 Qwen3ASRConfig（vllm.transformers_utils.configs.qwen3_asr
+    # 模块不存在）。这里删掉该映射，让 vLLM fallback 到 AutoConfig.from_pretrained，
+    # 即使用上面 AutoConfig.register 注册的 qwen_asr 自定义 Qwen3ASRConfig。
+    # 后续 vLLM 版本若修复了该模块，可移除这段。
+    try:
+        from vllm.transformers_utils.config import _CONFIG_REGISTRY
+        _CONFIG_REGISTRY.pop("qwen3_asr", None)
+    except Exception:
+        pass
 except:
     pass
 
