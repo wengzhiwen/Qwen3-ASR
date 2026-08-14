@@ -1,0 +1,32 @@
+# GB10 deployment for the hardened streaming server.
+#
+#   docker compose up -d --build   # first start (bakes deps into the image)
+#   docker compose restart         # after editing source under /ws (live-mounted)
+#
+# The image only bakes third-party deps; the repo root is mounted at /ws and
+# installed editable at container start, so source edits take effect on
+# restart without a rebuild.
+services:
+  qwen3-asr:
+    build: .
+    image: qwen3-asr-gb10:latest
+    container_name: qwen3-asr
+    restart: unless-stopped
+    gpus: all
+    # network host: the browser client (meetingEZ) connects to :8000 directly.
+    network_mode: host
+    # NVIDIA-recommended flags: default 64MB SHMEM limit crashes vLLM.
+    ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    volumes:
+      - ..:/ws
+      - ~/models:/models:ro
+    working_dir: /ws
+    command: >
+      bash -c "pip install -e . --no-deps -q &&
+               exec qwen-asr-demo-streaming
+               --asr-model-path /models/Qwen3-ASR-1.7B
+               --host 0.0.0.0 --port 8000
+               --gpu-memory-utilization 0.2"
