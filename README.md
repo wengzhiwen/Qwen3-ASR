@@ -89,6 +89,9 @@ curl localhost:8000/api/stats       # 健康探测：{"detail":[],"sessions":0,.
 
 ```
 deploy/               GB10 部署（本 README 的展开版：组件选型理由与实测数据）
+examples/
+  example_streaming_http_client.py  流式服务的 HTTP 客户端示例（对拍线上协议，推荐先看）
+  example_qwen3_asr_*.py            进程内推理示例（vLLM / Transformers / 流式 / 对齐，上游原样）
 qwen_asr/
   cli/demo_streaming.py    强化版流式服务（本 fork 主要改动）
   inference/qwen3_asr.py   vLLM 0.15.x 兼容补丁
