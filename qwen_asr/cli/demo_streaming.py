@@ -25,6 +25,7 @@ Open:
   http://127.0.0.1:7860
 """
 import argparse
+import difflib
 import re
 import threading
 import time
@@ -121,6 +122,9 @@ MAX_BUFFER_SEC = 45.0      # 未定稿音频缓冲上限，超限整窗强制定
 CONTEXT_CHARS = 400        # 转写提示携带的已定稿上文长度
 VOICE_RMS = 0.015          # 低于此 RMS 视为无人声
 MIN_SENTENCE_CHARS = 4     # 定稿句的最短长度（过滤杂散标点）
+# 定稿增量去重：与已定稿末尾句相似度 ≥ DUP_RATIO 视为换述重复/复读，拒收。
+DUP_RATIO = 0.75
+DUP_LOOKBACK_SENTS = 3     # 只与已定稿的最后 N 句比对
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;.\n])")
 
@@ -185,17 +189,39 @@ def _transcribe(audio: np.ndarray, context: str, force_language: Optional[str] =
     return parse_asr_output(raw, user_language=force_language)
 
 
+def _similar_to_committed_tail(committed: str, candidate: str) -> bool:
+    """candidate 是否与已定稿末尾相同或高度相似（换述重复拒收用）。
+
+    窗口重叠区的句子常被 ASR 改写标点/措辞后再次产出（endswith 精确匹配
+    失效），幻觉复读则整句重播；两者都以"与最近定稿句相似度 ≥ 阈值"拒收。
+    只与最后 _DUP_LOOKBACK_SENTS 句比对，避免误杀间隔很久的合法复现。
+    """
+    if not committed or not candidate:
+        return False
+    if committed.endswith(candidate):
+        return True
+    tail_sentences = [t for t in _split_sentences(committed)[-DUP_LOOKBACK_SENTS:] if t.strip()]
+    for sent in tail_sentences:
+        if difflib.SequenceMatcher(None, sent, candidate).ratio() >= DUP_RATIO:
+            return True
+    return False
+
+
 def _merge_window_sentences(s: Session, window_text: str) -> None:
     """把窗口转写文本里的新完整句并入 committed_text。
 
-    窗口与已定稿内容有重叠（同一音频被再次转写），靠逐句 endswith 匹配
-    跳过已定稿句子；遇到首个未完成尾句即停（留给下一窗口补全）。
-    全部句子都已并入时，buffer 可整体释放。
+    窗口与已定稿内容有重叠（同一音频被再次转写），靠逐句匹配跳过已定稿
+    句子（精确 endswith 或相似度去重）；遇到首个未完成尾句即停（留给下一
+    窗口补全）。全部句子都已并入时，buffer 可整体释放。
     """
     matched = 0
     text = window_text or ""
     for sentence in _split_sentences(text):
         if s.committed_text.endswith(sentence):
+            matched += len(sentence)
+            continue
+        if _similar_to_committed_tail(s.committed_text, sentence):
+            # 换述重复/幻觉复读：拒收，但计为已覆盖（不阻塞 buffer 释放）。
             matched += len(sentence)
             continue
         if len(sentence.strip()) >= MIN_SENTENCE_CHARS:
@@ -211,11 +237,21 @@ def _merge_window_sentences(s: Session, window_text: str) -> None:
         s.new_audio_samples = 0
 
 
+def _rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(audio)))) if audio.size else 0.0
+
+
 def _run_window(s: Session) -> None:
-    """攒够 HOP_SEC 新音频后，对最近 WINDOW_SEC 音频做一次窗口转写。"""
+    """攒够 HOP_SEC 新音频后，对最近 WINDOW_SEC 音频做一次窗口转写。
+
+    窗口能量低于 VOICE_RMS（纯静音/底噪）时直接跳过：无声段送模型是
+    幻觉复读的头号来源，且白白消耗推理预算。
+    """
     window = s.buffer[-int(WINDOW_SEC * SAMPLE_RATE):]
     if len(window) < int(0.5 * SAMPLE_RATE):
         return
+    if _rms(window) < VOICE_RMS:
+        return  # 无声窗口不送模型；等有声后再转写（new_audio_samples 不清零）
     context = s.committed_text[-CONTEXT_CHARS:]
     language, text = _transcribe(window, context, force_language=s.force_language)
     if language:
@@ -225,24 +261,43 @@ def _run_window(s: Session) -> None:
 
 
 def _finalize_buffer(s: Session, reason: str) -> None:
-    """整窗收束：转写全部未定稿音频并整体定稿（静音停顿/缓冲上限/结束时调用）。"""
+    """整窗收束：转写全部未定稿音频并整体定稿（静音停顿/缓冲上限/结束时调用）。
+
+    静音停顿期间此函数会被反复触发（每 0.5s chunk 一次），纯静音 buffer
+    必须跳过转写——否则模型每秒被喂两次无声音频，幻觉复读由此产生。
+    """
     buf_sec = len(s.buffer) / SAMPLE_RATE
     if buf_sec < 0.4:
+        return
+    if _rms(s.buffer) < VOICE_RMS:
+        # 无声 buffer：不送模型，直接丢弃（没有可定稿的内容）。
+        s.buffer = np.zeros((0,), dtype=np.float32)
+        s.new_audio_samples = 0
         return
     context = s.committed_text[-CONTEXT_CHARS:]
     language, text = _transcribe(s.buffer, context, force_language=s.force_language)
     text = (text or "").strip()
     if language:
         s.committed_language = language
-    if len(text) >= MIN_SENTENCE_CHARS:
-        if not _SENT_SPLIT_RE.split(text)[-1].strip() or text[-1] not in "。！？!?；;.\n":
-            text += "。"
-        s.committed_text += text
-    print(
-        f"[finalize:{reason}] buffer={buf_sec:.1f}s, 定稿={len(text)}字, "
-        f"累计={len(s.committed_text)}字",
-        flush=True,
-    )
+    # 逐句并入（带与已定稿尾部的去重），未完成尾句补句号后并入。
+    appended = 0
+    for sentence in _split_sentences(text):
+        if not _similar_to_committed_tail(s.committed_text, sentence):
+            if len(sentence.strip()) >= MIN_SENTENCE_CHARS:
+                s.committed_text += sentence
+                appended += len(sentence)
+        else:
+            appended += len(sentence)
+    tail = _SENT_SPLIT_RE.split(text)[-1].strip() if text else ""
+    if tail and len(tail) >= MIN_SENTENCE_CHARS and not _similar_to_committed_tail(s.committed_text, tail):
+        s.committed_text += tail + "。"
+        appended += len(tail)
+    if appended:
+        print(
+            f"[finalize:{reason}] buffer={buf_sec:.1f}s, 定稿={appended}字, "
+            f"累计={len(s.committed_text)}字",
+            flush=True,
+        )
     s.buffer = np.zeros((0,), dtype=np.float32)
     s.new_audio_samples = 0
     s.window_text = ""
