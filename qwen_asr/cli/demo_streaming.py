@@ -37,6 +37,7 @@ from flask import Flask, Response, jsonify, request
 from vllm import SamplingParams
 
 from qwen_asr import Qwen3ASRModel, parse_asr_output
+from qwen_asr.inference.utils import normalize_language_name, validate_language
 
 
 @dataclass
@@ -56,6 +57,8 @@ class Session:
     last_seen: float
     committed_text: str = ""
     committed_language: str = ""
+    # 强制转写语言（/api/start?language= 下发）。None = 自动检测。
+    force_language: Optional[str] = None
     buffer: np.ndarray = None
     new_audio_samples: int = 0      # 距上次窗口转写新增的音频量
     window_text: str = ""
@@ -146,21 +149,40 @@ def _get_session(session_id: str) -> Optional[Session]:
     return s
 
 
-def _transcribe(audio: np.ndarray, context: str):
+def _resolve_force_language(raw: Optional[str]) -> Optional[str]:
+    """规范化客户端语言参数；不支持/为空时回退自动检测，而不是抛 500。
+
+    必须在 qwen_asr 的 SUPPORTED_LANGUAGES 内（如 Japanese/Chinese/English）。
+    """
+    if not raw or not str(raw).strip():
+        return None
+    try:
+        ln = normalize_language_name(str(raw).strip())
+        validate_language(ln)
+        return ln
+    except ValueError as e:
+        print(f"[demo_streaming] 忽略不支持的 language={raw!r}: {e}", flush=True)
+        return None
+
+
+def _transcribe(audio: np.ndarray, context: str, force_language: Optional[str] = None):
     """对一段音频做一次「新鲜」转写（离线 generate 路径）。
 
     与上游 streaming_transcribe 的前缀续写不同：每次调用都从零转写整段
     窗口音频，已定稿文本只作为 prompt 的 context（背景提示），不参与
     续写。模型无法"判定无新内容"，聋态从机制上不存在。
+
+    force_language 经 _build_text_prompt 在 prompt 末尾追加
+    `language {Language}<asr_text>` 锁定输出语言（与官方流式内部机制相同）。
     """
-    prompt = asr._build_text_prompt(context=context, force_language=None)
+    prompt = asr._build_text_prompt(context=context, force_language=force_language)
     outputs = asr.model.generate(
         [{"prompt": prompt, "multi_modal_data": {"audio": [audio]}}],
         sampling_params=GEN_PARAMS,
         use_tqdm=False,
     )
     raw = outputs[0].outputs[0].text
-    return parse_asr_output(raw, user_language=None)
+    return parse_asr_output(raw, user_language=force_language)
 
 
 def _merge_window_sentences(s: Session, window_text: str) -> None:
@@ -195,7 +217,7 @@ def _run_window(s: Session) -> None:
     if len(window) < int(0.5 * SAMPLE_RATE):
         return
     context = s.committed_text[-CONTEXT_CHARS:]
-    language, text = _transcribe(window, context)
+    language, text = _transcribe(window, context, force_language=s.force_language)
     if language:
         s.committed_language = language
     _merge_window_sentences(s, text or "")
@@ -208,7 +230,7 @@ def _finalize_buffer(s: Session, reason: str) -> None:
     if buf_sec < 0.4:
         return
     context = s.committed_text[-CONTEXT_CHARS:]
-    language, text = _transcribe(s.buffer, context)
+    language, text = _transcribe(s.buffer, context, force_language=s.force_language)
     text = (text or "").strip()
     if language:
         s.committed_language = language
@@ -591,7 +613,13 @@ def api_start():
         return jsonify({"error": "too many sessions, retry later"}), 429
     session_id = uuid.uuid4().hex
     now = time.time()
-    SESSIONS[session_id] = Session(created_at=now, last_seen=now)
+    # language：强制转写语言（须为 qwen_asr 规范语言名，非法值回退自动检测）；
+    # secondary_language 是前端本地翻译链路的参数，ASR 侧忽略。
+    SESSIONS[session_id] = Session(
+        created_at=now,
+        last_seen=now,
+        force_language=_resolve_force_language(request.args.get("language")),
+    )
     return jsonify({"session_id": session_id})
 
 
