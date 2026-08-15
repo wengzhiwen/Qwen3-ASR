@@ -153,20 +153,27 @@ def _get_session(session_id: str) -> Optional[Session]:
     return s
 
 
-def _resolve_force_language(raw: Optional[str]) -> Optional[str]:
-    """规范化客户端语言参数；不支持/为空时回退自动检测，而不是抛 500。
+def _resolve_force_language(*raw_values: Optional[str]) -> Optional[str]:
+    """规范化客户端语言参数（主语言 + 第二语言），多值合并为逗号分隔串。
 
-    必须在 qwen_asr 的 SUPPORTED_LANGUAGES 内（如 Japanese/Chinese/English）。
+    每个值单独 normalize + validate（官方 validate_language 是单值白名单，
+    多值 join 后不能再整体校验），不支持的值丢弃并日志，保持回退自动检测
+    的兜底行为而不是抛 500。输出形如 "Japanese,Chinese"，由
+    _build_text_prompt 拼成 "language Japanese,Chinese<asr_text>" 后缀
+    （多值 prompt 模型是否原生支持无官方文档，属实验特性，见 A/B 结论）。
     """
-    if not raw or not str(raw).strip():
-        return None
-    try:
-        ln = normalize_language_name(str(raw).strip())
-        validate_language(ln)
-        return ln
-    except ValueError as e:
-        print(f"[demo_streaming] 忽略不支持的 language={raw!r}: {e}", flush=True)
-        return None
+    languages: list = []
+    for raw in raw_values:
+        if not raw or not str(raw).strip():
+            continue
+        try:
+            ln = normalize_language_name(str(raw).strip())
+            validate_language(ln)
+            if ln not in languages:
+                languages.append(ln)
+        except ValueError as e:
+            print(f"[demo_streaming] 忽略不支持的 language={raw!r}: {e}", flush=True)
+    return ",".join(languages) if languages else None
 
 
 def _transcribe(audio: np.ndarray, context: str, force_language: Optional[str] = None):
@@ -668,12 +675,15 @@ def api_start():
         return jsonify({"error": "too many sessions, retry later"}), 429
     session_id = uuid.uuid4().hex
     now = time.time()
-    # language：强制转写语言（须为 qwen_asr 规范语言名，非法值回退自动检测）；
-    # secondary_language 是前端本地翻译链路的参数，ASR 侧忽略。
+    # language：主强制语言；secondary_language：第二语言，与主语言合并为多值
+    # 强制（"Japanese,Chinese"，日中混说场景）。非法值逐个回退，不 500。
     SESSIONS[session_id] = Session(
         created_at=now,
         last_seen=now,
-        force_language=_resolve_force_language(request.args.get("language")),
+        force_language=_resolve_force_language(
+            request.args.get("language"),
+            request.args.get("secondary_language"),
+        ),
     )
     return jsonify({"session_id": session_id})
 
