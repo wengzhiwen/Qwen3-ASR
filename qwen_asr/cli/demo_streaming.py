@@ -125,6 +125,9 @@ MIN_SENTENCE_CHARS = 4     # 定稿句的最短长度（过滤杂散标点）
 # 定稿增量去重：与已定稿末尾句相似度 ≥ DUP_RATIO 视为换述重复/复读，拒收。
 DUP_RATIO = 0.75
 DUP_LOOKBACK_SENTS = 3     # 只与已定稿的最后 N 句比对
+# 整段复读防线：候选内容与定稿尾部字符窗口的块匹配覆盖率 ≥ DUP_COVERAGE 拒收。
+DUP_TAIL_CHARS = 400
+DUP_COVERAGE = 0.8
 
 _SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;.\n])")
 
@@ -197,11 +200,16 @@ def _transcribe(audio: np.ndarray, context: str, force_language: Optional[str] =
 
 
 def _similar_to_committed_tail(committed: str, candidate: str) -> bool:
-    """candidate 是否与已定稿末尾相同或高度相似（换述重复拒收用）。
+    """candidate 是否与已定稿末尾相同或高度相似（复读/换述重复拒收用）。
 
-    窗口重叠区的句子常被 ASR 改写标点/措辞后再次产出（endswith 精确匹配
-    失效），幻觉复读则整句重播；两者都以"与最近定稿句相似度 ≥ 阈值"拒收。
-    只与最后 _DUP_LOOKBACK_SENTS 句比对，避免误杀间隔很久的合法复现。
+    三层判定：
+    1. 精确后缀匹配（endswith）；
+    2. 与最后 DUP_LOOKBACK_SENTS 句逐一做相似度比对（抓换述重复）；
+    3. 子串重合：与已定稿尾部 DUP_TAIL_CHARS 字符窗口做块匹配，候选内容的
+       ≥ DUP_COVERAGE 比例在窗口内出现过即拒收。第 3 层针对整段复读：复读
+       第一句溜进来后，"末尾 N 句"窗口会被复读自身占据，后续每句比对的都
+       是复读自己的前缀，逐句比对永远抓不住（实测 6-8 句整段重复两遍全量
+       定稿）。块匹配用匹配块长度之和而非最长块，抗分句标点漂移错位。
     """
     if not committed or not candidate:
         return False
@@ -211,6 +219,11 @@ def _similar_to_committed_tail(committed: str, candidate: str) -> bool:
     for sent in tail_sentences:
         if difflib.SequenceMatcher(None, sent, candidate).ratio() >= DUP_RATIO:
             return True
+    tail = committed[-DUP_TAIL_CHARS:]
+    matcher = difflib.SequenceMatcher(None, tail, candidate)
+    matched = sum(block.size for block in matcher.get_matching_blocks())
+    if matched / max(1, len(candidate)) >= DUP_COVERAGE:
+        return True
     return False
 
 
