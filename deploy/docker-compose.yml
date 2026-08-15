@@ -13,7 +13,7 @@ services:
     container_name: qwen3-asr
     restart: unless-stopped
     gpus: all
-    # network host: the browser client (meetingEZ) connects to :8000 directly.
+    # network host: the browser client (meetingEZ) connects to :8001 directly.
     network_mode: host
     # NVIDIA-recommended flags: default 64MB SHMEM limit crashes vLLM.
     ipc: host
@@ -24,9 +24,15 @@ services:
       - ..:/ws
       - ~/models:/models:ro
     working_dir: /ws
-    command: >
-      bash -c "pip install -e . --no-deps -q &&
-               exec qwen-asr-demo-streaming
-               --asr-model-path /models/Qwen3-ASR-1.7B
-               --host 0.0.0.0 --port 8000
-               --gpu-memory-utilization 0.2"
+    # 注意：必须用列表形式。YAML 折叠标量（>）会保留比首行缩进更深的行里的
+    # 真实换行符，bash 把命令在换行处拆开，导致参数整行丢失（曾静默回退到
+    # 默认端口 8000 与默认显存配额 0.8，后者把 KV cache 分到 87GiB）。
+    command:
+      - bash
+      - -c
+      - >-
+        pip install -e . --no-deps -q &&
+        exec qwen-asr-demo-streaming
+        --asr-model-path /models/Qwen3-ASR-1.7B
+        --host 0.0.0.0 --port 8001
+        --gpu-memory-utilization 0.2

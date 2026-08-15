@@ -112,7 +112,7 @@ def stream_over_http(base_url: str, wav16k: np.ndarray, step_ms: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--url", default="http://localhost:8000", help="streaming service base URL")
+    parser.add_argument("--url", default="http://localhost:8001", help="streaming service base URL")
     parser.add_argument("--audio", default=None, help="local wav path (default: download the sample)")
     parser.add_argument("--step-ms", type=int, default=500, help="chunk size in ms (recommended: 500)")
     args = parser.parse_args()

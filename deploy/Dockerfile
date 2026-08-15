@@ -26,4 +26,4 @@ ENV VLLM_WORKER_MULTIPROC_METHOD=spawn \
 # qwen-asr source is live-mounted at /ws by docker-compose (editable install,
 # code changes only need a container restart). Model weights mount at /models.
 WORKDIR /ws
-EXPOSE 8000
+EXPOSE 8001

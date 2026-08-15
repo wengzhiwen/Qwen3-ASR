@@ -31,7 +31,7 @@
 cd deploy
 docker compose up -d --build        # 首次：构建镜像并烘焙依赖（几分钟）
 docker compose logs -f qwen3-asr    # 看加载进度，出现 "Running on" 即就绪（约 1 分钟）
-curl localhost:8000/api/stats       # 健康探测：{"detail":[],"sessions":0,...}
+curl localhost:8001/api/stats       # 健康探测：{"detail":[],"sessions":0,...}
 ```
 
 改了源码后只需 `docker compose restart`（仓库根目录 live-mount 在容器 `/ws`，无需 rebuild）。
@@ -57,7 +57,7 @@ curl localhost:8000/api/stats       # 健康探测：{"detail":[],"sessions":0,.
 |---|---|---|
 | `--gpu-memory-utilization` | 0.2 | **统一内存语义与独显不同**：0.2 ≈ 24GiB。GB10 与其他模型共存时从 0.2 起，实测内存平稳后可上调 |
 | `--session-rotate-sec` | 60 | 单段音频上限；静音切断（2s 无声）通常先触发，此值兜底连续说话 |
-| `--host/--port` | 0.0.0.0:8000 | |
+| `--host/--port` | 0.0.0.0:8001 | |
 
 分段策略核心参数（VAD 阈值 0.015 / 静音 2s / 短段 3 字过滤）在 `qwen_asr/cli/demo_streaming.py` 顶部常量区。
 

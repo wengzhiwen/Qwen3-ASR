@@ -8,7 +8,7 @@
 cd deploy
 docker compose up -d --build        # 首次：构建镜像（烘焙依赖层，之后重启秒起）
 docker compose logs -f qwen3-asr    # 看模型加载进度（约 1 分钟）
-curl localhost:8000/api/stats       # 就绪探测
+curl localhost:8001/api/stats       # 就绪探测
 ```
 
 前提：模型权重位于 `~/models/Qwen3-ASR-1.7B`（可在 compose 里改挂载路径），
