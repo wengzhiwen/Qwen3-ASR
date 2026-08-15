@@ -25,43 +25,49 @@ Open:
   http://127.0.0.1:7860
 """
 import argparse
+import re
 import threading
 import time
 import uuid
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, Optional
 
 import numpy as np
 from flask import Flask, Response, jsonify, request
-from qwen_asr import Qwen3ASRModel
+from vllm import SamplingParams
+
+from qwen_asr import Qwen3ASRModel, parse_asr_output
 
 
 @dataclass
 class Session:
-    state: object
+    """窗口式增量转写的会话状态。
+
+    核心思路：不依赖上游 streaming_transcribe 的"前缀续写"机制（该机制在
+    连续解说场景下模型常判定无新内容、回滚逐句吃掉前文，实测不可靠）。
+    改为每 HOP_SEC 秒把「最近 WINDOW_SEC 音频 + 已定稿上文」从头转写一次
+    （离线 generate 路径，稳定），句级匹配把新完整句并入 committed_text。
+
+    - buffer：自上次"全部定稿"以来累积的未定稿音频（有 MAX_BUFFER_SEC 上限）
+    - committed_text：已定稿全文，只增不改（客户端字幕的稳定来源）
+    - window_text / window_matched：最近一次窗口转写结果及其已并入前缀长度
+    """
     created_at: float
     last_seen: float
-    # 会话轮转：已收段定格的文本/语言。流式是累积式重转写，音频若无限增长，
-    # 每次推理的计算/内存/延迟都随会议时长线性上升，长会话必然爆内存。
-    # 定期收段重开，把每段音频长度限制在 SESSION_ROTATE_SEC 内。
     committed_text: str = ""
     committed_language: str = ""
-    # 停滞检测：段内模型贪心解码可能陷入"每步都判无新内容"的聋态（实测整段
-    # 120s 只产出 6 字，直到轮转清空前缀才自愈）。连续 N 个生成步文本不增
-    # 就强制收段，把最长停顿从一整段压到数秒。
-    # text_hist 按生成步记录已解析文本长度：既抓"完全不增"（3 步），也抓
-    # "缓慢吐碎字"（8 步增长 <6 字，实测曾整段 120s 只出 23 字骗过计数器）。
-    stall_count: int = 0
-    last_chunk_id: int = -1
-    last_raw_len: int = -1
-    text_hist: deque = field(default_factory=lambda: deque(maxlen=16))
-    # 音频能量监控：区分"模型聋"与"浏览器送来的音频本身静音"（麦克风权限
-    # 丢失/标签页采集中断等）。last_rms 为最近一个 chunk 的均方根音量；
-    # silent_samples 为连续静音采样数（VAD 静音切断用，有人声即清零）。
+    buffer: np.ndarray = None
+    new_audio_samples: int = 0      # 距上次窗口转写新增的音频量
+    window_text: str = ""
+    window_matched: int = 0
+    # 音频能量监控：区分"无语音"与"上游送静音"（麦克风权限丢失等）。
     last_rms: float = 0.0
     silent_chunks: int = 0
     silent_samples: int = 0
+
+    def __post_init__(self):
+        if self.buffer is None:
+            self.buffer = np.zeros((0,), dtype=np.float32)
 
 
 app = Flask(__name__)
@@ -96,41 +102,39 @@ def _enable_cors(resp):
 
 
 global asr
-global UNFIXED_CHUNK_NUM
-global UNFIXED_TOKEN_NUM
-global CHUNK_SIZE_SEC
-global SESSION_ROTATE_SEC
+global GEN_PARAMS
 
 SESSIONS: Dict[str, Session] = {}
 SESSION_TTL_SEC = 10 * 60
-# 单段音频时长上限（秒）。静音切断通常先于此触发；此值兜底连续不停说话的场景。
-SESSION_ROTATE_SEC = 60.0
 # 并发 session 上限（防页面刷新/多标签泄漏 session）。
 MAX_SESSIONS = 8
-# ---- 分段策略（移植自 Quantatirsk/qwen3-asr 的实测调优） ----
-# VAD 静音切断：RMS 低于 VOICE_RMS 视为无人声，连续 SILENCE_TRUNCATE_SEC
-# 即收段。在句子自然停顿处切断，从根源避免"固定时长切在句中"导致的前缀
-# 失配聋段。VOICE_RMS=0.015、静音 2s、最长 60s、短段 3 字过滤均取自该项目的
-# WebSocket Qwen 流式路径（app/services/qwen3_websocket_asr.py）。
-VOICE_RMS = 0.015
-SILENCE_TRUNCATE_SEC = 2.0
-MIN_SEGMENT_CHARS = 3
-# 串行化所有 vLLM generate 调用（转写/收段/finish/GC）。单 GPU 场景下并发请求
-# 只会叠加激活内存峰值、互相拖慢，串行后峰值可控且延迟更稳。
-# 用 RLock：api_chunk 持锁调用 _rotate_session_if_due，后者不可再次获取非重入锁
-# （曾导致第一次轮转即自死锁、转写永久冻结，2026-08-14 py-spy 实锤）。
+
+SAMPLE_RATE = 16000
+# ---- 窗口式增量转写参数 ----
+WINDOW_SEC = 10.0          # 每步新鲜转写的音频窗口长度
+HOP_SEC = 2.0              # 攒够多少新音频触发一次窗口转写
+SILENCE_COMMIT_SEC = 2.0   # 连续静音秒数 → 整窗收束定稿
+MAX_BUFFER_SEC = 45.0      # 未定稿音频缓冲上限，超限整窗强制定稿
+CONTEXT_CHARS = 400        # 转写提示携带的已定稿上文长度
+VOICE_RMS = 0.015          # 低于此 RMS 视为无人声
+MIN_SENTENCE_CHARS = 4     # 定稿句的最短长度（过滤杂散标点）
+
+_SENT_SPLIT_RE = re.compile(r"(?<=[。！？!?；;.\n])")
+
+# 串行化所有 vLLM generate 调用。单 GPU 场景下并发请求只会叠加激活内存
+# 峰值、互相拖慢；RLock 防御嵌套获取。
 _ASR_LOCK = threading.RLock()
+
+
+def _split_sentences(text: str) -> list:
+    """按句末标点切句，保留标点在句尾。"""
+    return [p for p in _SENT_SPLIT_RE.split(text or "") if p.strip()]
 
 
 def _gc_sessions():
     now = time.time()
     dead = [sid for sid, s in SESSIONS.items() if now - s.last_seen > SESSION_TTL_SEC]
     for sid in dead:
-        try:
-            with _ASR_LOCK:
-                asr.finish_streaming_transcribe(SESSIONS[sid].state)
-        except Exception:
-            pass
         SESSIONS.pop(sid, None)
 
 
@@ -142,82 +146,99 @@ def _get_session(session_id: str) -> Optional[Session]:
     return s
 
 
-def _rotate_session_if_due(s: Session, force: bool = False, reason: str = ""):
-    """收段重开，限制单段音频长度。三种触发：
-    1. VAD 静音切断（优先，切在句子边界）：连续静音 ≥ SILENCE_TRUNCATE_SEC；
-    2. 时长切断：段音频 ≥ SESSION_ROTATE_SEC；
-    3. 停滞切断（force=True，_track_stall 触发）：段内文本增速异常。
+def _transcribe(audio: np.ndarray, context: str):
+    """对一段音频做一次「新鲜」转写（离线 generate 路径）。
 
-    收段动作：finish 当前 state（flush 尾部音频，定格本段末句）→ 文本并入
-    committed_text（短于 MIN_SEGMENT_CHARS 的段视为噪声丢弃）→ 重开新 state。
+    与上游 streaming_transcribe 的前缀续写不同：每次调用都从零转写整段
+    窗口音频，已定稿文本只作为 prompt 的 context（背景提示），不参与
+    续写。模型无法"判定无新内容"，聋态从机制上不存在。
     """
-    audio_sec = len(s.state.audio_accum) / 16000.0  # SAMPLE_RATE = 16000
-    silence_sec = s.silent_samples / 16000.0
-    if not force:
-        if silence_sec >= SILENCE_TRUNCATE_SEC:
-            reason = "silence"
-        elif audio_sec < SESSION_ROTATE_SEC:
-            return
-        else:
-            reason = "max_duration"
-    if not reason:
-        reason = "stall"
-    # 调用方（api_chunk）已持有 _ASR_LOCK，这里直接调用，不再嵌套获取。
-    try:
-        asr.finish_streaming_transcribe(s.state)
-    except Exception:
-        pass
-    seg_text = getattr(s.state, "text", "") or ""
-    if len(seg_text.strip()) >= MIN_SEGMENT_CHARS:
-        s.committed_text += seg_text
-        if getattr(s.state, "language", ""):
-            s.committed_language = s.state.language
-    else:
-        reason += "(短段过滤)"
-    s.state = asr.init_streaming_state(
-        unfixed_chunk_num=UNFIXED_CHUNK_NUM,
-        unfixed_token_num=UNFIXED_TOKEN_NUM,
-        chunk_size_sec=CHUNK_SIZE_SEC,
+    prompt = asr._build_text_prompt(context=context, force_language=None)
+    outputs = asr.model.generate(
+        [{"prompt": prompt, "multi_modal_data": {"audio": [audio]}}],
+        sampling_params=GEN_PARAMS,
+        use_tqdm=False,
     )
-    s.stall_count = 0
-    s.last_chunk_id = -1
-    s.last_raw_len = -1
-    s.text_hist.clear()
-    s.silent_samples = 0
+    raw = outputs[0].outputs[0].text
+    return parse_asr_output(raw, user_language=None)
+
+
+def _merge_window_sentences(s: Session, window_text: str) -> None:
+    """把窗口转写文本里的新完整句并入 committed_text。
+
+    窗口与已定稿内容有重叠（同一音频被再次转写），靠逐句 endswith 匹配
+    跳过已定稿句子；遇到首个未完成尾句即停（留给下一窗口补全）。
+    全部句子都已并入时，buffer 可整体释放。
+    """
+    matched = 0
+    text = window_text or ""
+    for sentence in _split_sentences(text):
+        if s.committed_text.endswith(sentence):
+            matched += len(sentence)
+            continue
+        if len(sentence.strip()) >= MIN_SENTENCE_CHARS:
+            s.committed_text += sentence
+            matched += len(sentence)
+        else:
+            break  # 未完成/过短的尾句，留在窗口里
+    s.window_text = text
+    s.window_matched = matched
+    if matched >= len(text.rstrip()):
+        # 窗口文本全部定稿：对应音频可释放，从下一句重新累积。
+        s.buffer = np.zeros((0,), dtype=np.float32)
+        s.new_audio_samples = 0
+
+
+def _run_window(s: Session) -> None:
+    """攒够 HOP_SEC 新音频后，对最近 WINDOW_SEC 音频做一次窗口转写。"""
+    window = s.buffer[-int(WINDOW_SEC * SAMPLE_RATE):]
+    if len(window) < int(0.5 * SAMPLE_RATE):
+        return
+    context = s.committed_text[-CONTEXT_CHARS:]
+    language, text = _transcribe(window, context)
+    if language:
+        s.committed_language = language
+    _merge_window_sentences(s, text or "")
+    s.new_audio_samples = 0
+
+
+def _finalize_buffer(s: Session, reason: str) -> None:
+    """整窗收束：转写全部未定稿音频并整体定稿（静音停顿/缓冲上限/结束时调用）。"""
+    buf_sec = len(s.buffer) / SAMPLE_RATE
+    if buf_sec < 0.4:
+        return
+    context = s.committed_text[-CONTEXT_CHARS:]
+    language, text = _transcribe(s.buffer, context)
+    text = (text or "").strip()
+    if language:
+        s.committed_language = language
+    if len(text) >= MIN_SENTENCE_CHARS:
+        if not _SENT_SPLIT_RE.split(text)[-1].strip() or text[-1] not in "。！？!?；;.\n":
+            text += "。"
+        s.committed_text += text
     print(
-        f"[rotate:{reason}] audio={audio_sec:.1f}s, silence={silence_sec:.1f}s, "
-        f"段文本={len(seg_text)}字, 累计={len(s.committed_text)}字",
+        f"[finalize:{reason}] buffer={buf_sec:.1f}s, 定稿={len(text)}字, "
+        f"累计={len(s.committed_text)}字",
         flush=True,
     )
-
-
-def _track_stall(s: Session):
-    """每个生成步后检查已解析文本增速；聋态即强制收段。
-
-    两条判据（都以 state.text——用户可见文本——为准）：
-    1. 快路径：连续 3 步完全不增；
-    2. 慢路径：最近 8 步总增长 <6 字（缓慢吐碎字的"半聋"，曾整段骗过计数器）。
-    仅在段内已有文本且音频 >12s 时触发；纯静音段不抢救（轮转无意义）。
-    """
-    cid = getattr(s.state, "chunk_id", 0)
-    if cid == s.last_chunk_id:
-        return  # 本 chunk 未触发生成（服务端按 1s 攒批）
-    s.last_chunk_id = cid
-    text_len = len(getattr(s.state, "text", "") or "")
-    s.text_hist.append(text_len)
-
-    fast_stall = len(s.text_hist) >= 3 and s.text_hist[-1] <= s.text_hist[-3]
-    anemic = len(s.text_hist) >= 8 and (s.text_hist[-1] - s.text_hist[-8]) < 6
-    audio_sec = len(s.state.audio_accum) / 16000.0
-    if (fast_stall or anemic) and text_len > 0 and audio_sec >= 12:
-        _rotate_session_if_due(s, force=True)
+    s.buffer = np.zeros((0,), dtype=np.float32)
+    s.new_audio_samples = 0
+    s.window_text = ""
+    s.window_matched = 0
 
 
 def _merged_result(s: Session) -> dict:
-    """对外的完整结果 = 已收段文本 + 当前段文本。"""
+    """对外结果：合并全文 + 分段视图。
+
+    committed_text 只增不改（客户端字幕的稳定来源）；segment_text 是最近
+    一次窗口转写里尚未定稿的尾句（live 行，随时可能被下一窗口改写）。
+    """
+    live_tail = s.window_text[s.window_matched:] if s.window_matched < len(s.window_text) else ""
     return {
-        "language": (getattr(s.state, "language", "") or s.committed_language or ""),
-        "text": s.committed_text + (getattr(s.state, "text", "") or ""),
+        "language": s.committed_language,
+        "text": s.committed_text + live_tail,
+        "committed_text": s.committed_text,
+        "segment_text": live_tail,
     }
 
 
@@ -569,13 +590,8 @@ def api_start():
     if len(SESSIONS) >= MAX_SESSIONS:
         return jsonify({"error": "too many sessions, retry later"}), 429
     session_id = uuid.uuid4().hex
-    state = asr.init_streaming_state(
-        unfixed_chunk_num=UNFIXED_CHUNK_NUM,
-        unfixed_token_num=UNFIXED_TOKEN_NUM,
-        chunk_size_sec=CHUNK_SIZE_SEC,
-    )
     now = time.time()
-    SESSIONS[session_id] = Session(state=state, created_at=now, last_seen=now)
+    SESSIONS[session_id] = Session(created_at=now, last_seen=now)
     return jsonify({"session_id": session_id})
 
 
@@ -595,7 +611,7 @@ def api_chunk():
 
     wav = np.frombuffer(raw, dtype=np.float32).reshape(-1)
 
-    # 音频能量监控：区分"模型聋"与"上游送静音"；silent_samples 供 VAD 静音切断。
+    # 音频能量监控：区分"无语音"与"上游送静音"。
     s.last_rms = round(float(np.sqrt(np.mean(np.square(wav)))), 4) if wav.size else 0.0
     if s.last_rms < VOICE_RMS:
         s.silent_chunks += 1
@@ -605,9 +621,17 @@ def api_chunk():
         s.silent_samples = 0
 
     with _ASR_LOCK:
-        _rotate_session_if_due(s)
-        asr.streaming_transcribe(wav, s.state)
-        _track_stall(s)
+        s.buffer = np.concatenate([s.buffer, wav.astype(np.float32)])
+        s.new_audio_samples += int(wav.size)
+        buf_sec = len(s.buffer) / SAMPLE_RATE
+
+        if s.silent_samples >= int(SILENCE_COMMIT_SEC * SAMPLE_RATE) and buf_sec >= 0.4:
+            # 停顿：整窗收束定稿（把半句也定格，下次说话重新累积）。
+            _finalize_buffer(s, "silence")
+        elif buf_sec >= MAX_BUFFER_SEC:
+            _finalize_buffer(s, "max_buffer")
+        elif s.new_audio_samples >= int(HOP_SEC * SAMPLE_RATE):
+            _run_window(s)
 
     return jsonify(_merged_result(s))
 
@@ -620,7 +644,7 @@ def api_finish():
         return jsonify({"error": "invalid session_id"}), 400
 
     with _ASR_LOCK:
-        asr.finish_streaming_transcribe(s.state)
+        _finalize_buffer(s, "finish")
     out = _merged_result(s)
     SESSIONS.pop(session_id, None)
     return jsonify(out)
@@ -628,19 +652,18 @@ def api_finish():
 
 @app.route("/api/stats", methods=["GET"])
 def api_stats():
-    """诊断端点：当前 session 数与各段音频时长/文本长度，便于排查内存问题。"""
+    """诊断端点：session 数与各会话缓冲/定稿状态。"""
     return jsonify(
         {
             "sessions": len(SESSIONS),
-            "rotate_sec": SESSION_ROTATE_SEC,
             "detail": [
                 {
                     "session_id": sid,
                     "age_sec": round(time.time() - s.created_at, 1),
                     "idle_sec": round(time.time() - s.last_seen, 1),
-                    "audio_sec": round(len(s.state.audio_accum) / 16000.0, 1),
+                    "buffer_sec": round(len(s.buffer) / SAMPLE_RATE, 1),
                     "committed_chars": len(s.committed_text),
-                    "segment_chars": len(getattr(s.state, "text", "") or ""),
+                    "live_tail_chars": max(0, len(s.window_text) - s.window_matched),
                     "last_rms": s.last_rms,
                     "silent_chunks": s.silent_chunks,
                 }
@@ -656,14 +679,6 @@ def parse_args():
     p.add_argument("--host", default="0.0.0.0", help="Bind host")
     p.add_argument("--port", type=int, default=8000, help="Bind port")
     p.add_argument("--gpu-memory-utilization", type=float, default=0.8, help="vLLM GPU memory utilization")
-
-    p.add_argument("--unfixed-chunk-num", type=int, default=2,
-                   help="段开头无前缀的 chunk 数（Quantatirsk 调优值，越小段首抖动越少）")
-    p.add_argument("--unfixed-token-num", type=int, default=5)
-    p.add_argument("--chunk-size-sec", type=float, default=2.0,
-                   help="流式攒批步长秒（Quantatirsk 调优值，越大请求率越低）")
-    p.add_argument("--session-rotate-sec", type=float, default=60.0,
-                   help="单段音频上限（秒）；静音切断（2s 无声）通常先于此触发")
     return p.parse_args()
 
 
@@ -671,26 +686,19 @@ def main():
     args = parse_args()
 
     global asr
-    global UNFIXED_CHUNK_NUM
-    global UNFIXED_TOKEN_NUM
-    global CHUNK_SIZE_SEC
-    global SESSION_ROTATE_SEC
-
-    UNFIXED_CHUNK_NUM = args.unfixed_chunk_num
-    UNFIXED_TOKEN_NUM = args.unfixed_token_num
-    CHUNK_SIZE_SEC = args.chunk_size_sec
-    SESSION_ROTATE_SEC = max(30.0, float(args.session_rotate_sec))
+    global GEN_PARAMS
 
     asr = Qwen3ASRModel.LLM(
         model=args.asr_model_path,
         gpu_memory_utilization=args.gpu_memory_utilization,
-        # 会话轮转下单段音频 ≤180s（约 2400 audio tokens），16k 上限绰绰有余，
-        # 同时把内存 profiler 的音频预算从 65536 压下来，降低常驻内存。
+        # 窗口式转写下单次请求 ≤45s 音频（约 600 audio tokens）+ 上文，16k 上限
+        # 绰绰有余，同时把内存 profiler 的音频预算压下来，降低常驻内存。
         max_model_len=16384,
         # 单用户流式场景：限制并发调度序列数，防止偶发并发请求叠加激活内存峰值。
         max_num_seqs=4,
-        max_new_tokens=32,
     )
+    # 窗口转写是"新鲜"转写：每步要输出整个窗口的文本（而非增量），上限给足。
+    GEN_PARAMS = SamplingParams(temperature=0.0, max_tokens=512)
     print("Model loaded.")
     app.run(host=args.host, port=args.port, debug=False, use_reloader=False, threaded=True)
 
